@@ -134,7 +134,8 @@ class BertModel(object):
                input_mask=None,
                token_type_ids=None,
                use_one_hot_embeddings=True,
-               scope=None):
+               scope=None,
+	       compute_type=tf.float32):
     """Constructor for BertModel.
 
     Args:
@@ -149,6 +150,7 @@ class BertModel(object):
         it is much faster if this is True, on the CPU or GPU, it is faster if
         this is False.
       scope: (optional) variable scope. Defaults to "bert".
+      compute_type: (optional) either float32 or float16. Only applies to GPUs.
 
     Raises:
       ValueError: The config is invalid or one of the input tensor shapes
@@ -171,6 +173,8 @@ class BertModel(object):
 
     with tf.variable_scope(scope, default_name="bert"):
       with tf.variable_scope("embeddings"):
+        # For good convergence with mixed precision training,
+	# it is important that the embedding codes remain fp32.
         # Perform embedding lookup on the word ids.
         (self.embedding_output, self.embedding_table) = embedding_lookup(
             input_ids=input_ids,
@@ -204,7 +208,9 @@ class BertModel(object):
         # Run the stacked transformer.
         # `sequence_output` shape = [batch_size, seq_length, hidden_size].
         self.all_encoder_layers = transformer_model(
-            input_tensor=self.embedding_output,
+            # Cast input tensor to compute_type so that entire
+            # transformer stack runs with compute_type precision
+            input_tensor=tf.cast(self.embedding_output, compute_type),
             attention_mask=attention_mask,
             hidden_size=config.hidden_size,
             num_hidden_layers=config.num_hidden_layers,
@@ -274,7 +280,10 @@ def gelu(input_tensor):
   Returns:
     `input_tensor` with the GELU activation applied.
   """
-  cdf = 0.5 * (1.0 + tf.erf(input_tensor / tf.sqrt(2.0)))
+  # Changed tf.sqrt(2.0) to the literal 1.414213562,
+  # because tf.sqrt(2.0) returns a tf.float32 value,
+  # which causes problems for mixed precision training.
+  cdf = 0.5 * (1.0 + tf.cast(tf.erf(tf.cast(input_tensor, tf.float32)), input_tensor.dtype) / 1.414213562)
   return input_tensor * cdf
 
 
@@ -362,8 +371,18 @@ def dropout(input_tensor, dropout_prob):
 
 def layer_norm(input_tensor, name=None):
   """Run layer normalization on the last dimension of the tensor."""
-  return tf.contrib.layers.layer_norm(
-      inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name)
+  if input_tensor.dtype == tf.float16:
+    try:
+      from fused_layer_norm import fused_layer_norm
+      return fused_layer_norm(
+          inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name,
+          use_fused_batch_norm=True)
+    except ImportError:
+      return tf.contrib.layers.layer_norm(
+          inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name)
+  else:
+    return tf.contrib.layers.layer_norm(
+        inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name)
 
 
 def layer_norm_and_dropout(input_tensor, dropout_prob, name=None):
@@ -711,7 +730,7 @@ def attention_layer(from_tensor,
     # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
     # masked positions, this operation will create a tensor which is 0.0 for
     # positions we want to attend and -10000.0 for masked positions.
-    adder = (1.0 - tf.cast(attention_mask, tf.float32)) * -10000.0
+    adder = (1.0 - tf.cast(attention_mask, attention_scores.dtype)) * -10000.0
 
     # Since we are adding it to the raw scores before the softmax, this is
     # effectively the same as removing these entirely.
