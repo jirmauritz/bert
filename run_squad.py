@@ -28,6 +28,7 @@ import optimization
 import tokenization
 import six
 import tensorflow as tf
+from time import time
 
 flags = tf.flags
 
@@ -1237,6 +1238,7 @@ def main(_):
       eval_features.append(feature)
       eval_writer.process_feature(feature)
 
+    t0 = time()
     convert_examples_to_features(
         examples=eval_examples,
         tokenizer=tokenizer,
@@ -1275,6 +1277,7 @@ def main(_):
               unique_id=unique_id,
               start_logits=start_logits,
               end_logits=end_logits))
+    tf.logging.info(f"TIME: {time() - t0}")
 
     output_prediction_file = os.path.join(FLAGS.output_dir, "predictions.json")
     output_nbest_file = os.path.join(FLAGS.output_dir, "nbest_predictions.json")
